@@ -1,4 +1,4 @@
-from multiprocessing import Process, Condition, Semaphore
+from multiprocessing import Process, Condition, Lock, Semaphore
 from multiprocessing.sharedctypes import RawValue, RawArray
 import ctypes
 import numpy as np
@@ -8,30 +8,30 @@ import threading
 class Module(Process):
     def __init__(self, interface, reads=[], writes=[]):
         Process.__init__(self)
-        self._reads = reads
-        self._writes = writes
+        self._reads = {}
+        self._writes = {}
         self.interface = interface
-        for variable in self._reads:
-            self.interface.gate(variable).addConsumer()
-        for variable in self._writes:
-            self.interface.gate(variable).addProducer()
+        for variable in reads:
+            self._reads[variable] = self.interface.gate(variable).addConsumer()
+        for variable in writes:
+            self._writes[variable] = self.interface.gate(variable).addProducer()
 
     def run(self):
         self.setup()
 
         while True:
-            for variable in self._reads:
-                self.interface.gate(variable).awaitProducer()
+            for variable, i in self._reads.items():
+                self.interface.gate(variable).awaitProducer(i)
 
             result = self.iterate()
 
-            for variable in self._reads:
-                self.interface.gate(variable).consume()
+            for variable, i in self._reads.items():
+                self.interface.gate(variable).consume(i)
 
-            for variable in self._writes:
+            for variable, i in self._writes.items():
                 self.interface.gate(variable).produce()
 
-            for variable in self._writes:
+            for variable, i in self._writes.items():
                 self.interface.gate(variable).awaitConsumers()
 
     def startAsThread(self):
@@ -71,16 +71,29 @@ class Interface:
         return self._gates[self._lookup[variable]]
 
     def remap(self, mapping):
-        lookup = { (mapping[variable] if variable in mapping.keys() else variable) : index for variable, index in self._lookup.items() }
+        lookup = {}
+        for variable, index in self._lookup.items():
+            if variable in mapping.keys():
+                lookup[mapping[variable]] = index
+            elif variable not in lookup.keys():
+                lookup[variable] = index
         return Interface(self._objects, self._gates, lookup)
 
     def use(self, namespace):
         n = len(namespace) + 1
-        lookup = { (variable[n:] if variable.startswith(namespace + ".") else variable) : index for variable, index in self._lookup.items() }
+        lookup = {}
+        for variable, index in self._lookup.items():
+            if variable.startswith(namespace + "."):
+                lookup[variable[n:]] = index
+            elif variable not in lookup.keys():
+                lookup[variable] = index
         return Interface(self._objects, self._gates, lookup)
 
     def wrap(self, namespace):
-        lookup = { (namespace + "." + variable) : index for variable, index in self._lookup.items() }
+        lookup = {}
+        for variable, index in self._lookup.items():
+            if variable not in lookup.keys():
+                lookup[namespace + "." + variable] = index
         return Interface(self._objects, self._gates, lookup)
 
     def link(self, origin, target):
@@ -88,40 +101,46 @@ class Interface:
 
 class Gate:
     def __init__(self):
-        self.consumers = 0
-        self.producers = 0
-        self.producerSemaphore = Semaphore(value=0)
-        self.consumerSemaphore = Semaphore(value=0)
+        self.consumers = []
+        self.producers = []
+        self.producing = False
 
     def addConsumer(self):
-        self.consumers += 1
+        self.consumers += [Semaphore(value=0)]
+        self.producers += [Semaphore(value=0)]
+        return len(self.consumers) - 1
 
     def addProducer(self):
-        self.producers += 1
+        if self.producing:
+            raise ValueError
+        else:
+            self.producing = True
+            return 0
 
-    def awaitProducer(self):
-        for i in range(self.producers):
-            self.producerSemaphore.acquire()
+    def awaitProducer(self, i):
+        if self.producing:
+            self.producers[i].acquire()
 
     def produce(self):
-        for i in range(self.consumers):
-            self.producerSemaphore.release()
+        for lock in self.producers:
+            lock.release()
 
     def awaitConsumers(self):
-        for i in range(self.consumers):
-            self.consumerSemaphore.acquire()
+        for lock in self.consumers:
+            lock.acquire()
 
-    def consume(self):
-        for i in range(self.producers):
-            self.consumerSemaphore.release()
-
-    def unlock(self, name):
-        self._locks[name].release()
+    def consume(self, i):
+        if self.producing:
+            self.consumers[i].release()
 
 typemap = {
     "float" : ctypes.c_double,
+    "float64" : ctypes.c_double,
     "int" : ctypes.c_int64,
     "uint8" : ctypes.c_uint8,
+    "uint16" : ctypes.c_uint16,
+    "uint32" : ctypes.c_uint32,
+    "uint64" : ctypes.c_uint64,
     "bool" : ctypes.c_byte }
 
 def shared_value(default, dtype="float"):
